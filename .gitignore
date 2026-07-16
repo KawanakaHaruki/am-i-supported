@@ -1,0 +1,9 @@
+# CIがデプロイ時に生成する(リポジトリには含めない)
+versions.json
+
+# 検証時のログ
+dev/reports.ndjson
+
+_site/
+.DS_Store
+.claude/
