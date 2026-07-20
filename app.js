@@ -133,18 +133,54 @@ function detectOS(ua, platformVersion) {
   return "不明";
 }
 
+function deviceInfo(hints) {
+  const parts = [navigator.maxTouchPoints > 0 ? "タッチ対応" : "タッチ非対応"];
+  if (navigator.hardwareConcurrency) parts.push("CPU " + navigator.hardwareConcurrency + "スレッド");
+  if (navigator.deviceMemory) parts.push("メモリ " + navigator.deviceMemory + "GB以上"); // 仕様上8GBに丸められる
+  if (hints && hints.model) parts.push("機種: " + hints.model);
+  if (hints && hints.architecture) parts.push(hints.architecture + (hints.bitness ? " " + hints.bitness + "bit" : ""));
+  return parts.join(" / ");
+}
+
+function timezoneLabel() {
+  const offset = -new Date().getTimezoneOffset() / 60;
+  const utc = "UTC" + (offset >= 0 ? "+" : "") + offset;
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone + "(" + utc + ")";
+  } catch (e) {
+    return utc;
+  }
+}
+
+function storageState(name) {
+  // プライベートモードや設定によってはアクセス自体が例外になる
+  try {
+    window[name].setItem("__probe__", "1");
+    window[name].removeItem("__probe__");
+    return "利用可";
+  } catch (e) {
+    return "利用不可";
+  }
+}
+
+function networkLabel() {
+  const conn = navigator.connection;
+  return (navigator.onLine ? "オンライン" : "オフライン") + (conn && conn.effectiveType ? "(推定回線: " + conn.effectiveType + ")" : "");
+}
+
 async function detectEnvironment() {
   const ua = navigator.userAgent;
   let browser = parseUA(ua);
   let platformVersion = null;
+  let hints = null;
 
   // Chromium系は User-Agent Client Hints の方が正確(完全なバージョンが取れる)
   if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
     try {
-      const h = await navigator.userAgentData.getHighEntropyValues(["fullVersionList", "platformVersion"]);
-      platformVersion = h.platformVersion || null;
+      hints = await navigator.userAgentData.getHighEntropyValues(["fullVersionList", "platformVersion", "model", "architecture", "bitness"]);
+      platformVersion = hints.platformVersion || null;
       const known = { "Microsoft Edge": "edge", "Google Chrome": "chrome", "Opera": "opera" };
-      for (const b of h.fullVersionList || []) {
+      for (const b of hints.fullVersionList || []) {
         if (known[b.brand]) {
           browser = { key: known[b.brand], name: b.brand, version: b.version };
           break;
@@ -159,8 +195,15 @@ async function detectEnvironment() {
 
   return {
     browser,
-    os: detectOS(ua, platformVersion),
+    os: detectOS(ua, platformVersion) + (platformVersion ? "(platformVersion " + platformVersion + ")" : ""),
+    device: deviceInfo(hints),
     screen: screen.width + "×" + screen.height + (devicePixelRatio !== 1 ? "(表示倍率 " + devicePixelRatio + ")" : ""),
+    viewport: innerWidth + "×" + innerHeight,
+    language: (navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language]).join(", "),
+    timezone: timezoneLabel(),
+    storage: "Cookie: " + (navigator.cookieEnabled ? "有効" : "無効") + " / localStorage: " + storageState("localStorage") + " / sessionStorage: " + storageState("sessionStorage"),
+    network: networkLabel(),
+    url: location.href,
     ua,
     checkedAt: new Date(),
   };
@@ -232,7 +275,14 @@ function render(env, latest, verdict) {
     ["ブラウザ", env.browser.name + (env.browser.version ? " " + env.browser.version : "")],
     ["最新バージョン", latestLabel(latest)],
     ["OS", env.os],
+    ["デバイス", env.device],
     ["画面サイズ", env.screen],
+    ["ウィンドウサイズ", env.viewport],
+    ["言語", env.language],
+    ["タイムゾーン", env.timezone],
+    ["ストレージ", env.storage],
+    ["ネットワーク", env.network],
+    ["ページURL", env.url],
     ["チェック日時", formatDate(env.checkedAt)],
     ["ユーザーエージェント", env.ua],
   ];
@@ -244,7 +294,7 @@ function render(env, latest, verdict) {
     th.textContent = k;
     const td = document.createElement("td");
     td.textContent = v;
-    if (k === "ユーザーエージェント") td.className = "ua";
+    if (k === "ユーザーエージェント" || k === "ページURL") td.className = "ua";
     tr.append(th, td);
     tbody.append(tr);
   }
