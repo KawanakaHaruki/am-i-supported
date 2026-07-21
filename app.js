@@ -86,9 +86,9 @@ function parseUA(ua) {
     return m ? m[1] : null;
   };
 
-  // アプリ内ブラウザ(WebView)を先に検出
+  // アプリ内ブラウザ(WebView)を先に検出。LINEは外部ブラウザへ自動誘導できるため専用キーにする
+  if (/ Line\//i.test(ua)) return { key: "line", name: "LINE アプリ内ブラウザ", version: pick(/ Line\/([\d.]+)/i) };
   const inApp =
-    (/ Line\//i.test(ua) && "LINE") ||
     (/FBAN|FBAV/.test(ua) && "Facebook") ||
     (/Instagram/.test(ua) && "Instagram") ||
     (/YJApp/.test(ua) && "Yahoo! JAPAN") ||
@@ -168,6 +168,46 @@ function networkLabel() {
   return (navigator.onLine ? "オンライン" : "オフライン") + (conn && conn.effectiveType ? "(推定回線: " + conn.effectiveType + ")" : "");
 }
 
+/* ============================================================
+ * LINEアプリ内ブラウザのエンジン判定
+ * Android: システムWebView(Chromium)。Chrome本体と同一コードベースで
+ *          同時リリースされるため、UAの Chrome/ メジャーをそのまま使える。
+ * iOS: WKWebView(OS組み込みWebKit)。iOS 26以降、WebKitはUA内の
+ *      OSバージョンを凍結値(18_6等)で報告するためUAからは世代が分からない。
+ *      各Safari世代で初出荷された機能の有無(機能検出)で世代を判定する。
+ * ============================================================ */
+
+// 新しいSafariメジャーが出たら先頭にプローブを追加し、CEILINGも上げること。
+// 追随漏れは scripts/update-versions.mjs(CI)が検知して失敗する。
+const WEBKIT_PROBE_CEILING = 26;
+const WEBKIT_PROBES = [
+  // Safari 26.0: URLPattern / CSS Anchor Positioning
+  { major: 26, test: () => "URLPattern" in window || (window.CSS && CSS.supports("anchor-name", "--x")) },
+  // Safari 18.0: View Transitions
+  { major: 18, test: () => typeof document.startViewTransition === "function" },
+  // Safari 17.0: contain-intrinsic-size
+  { major: 17, test: () => window.CSS && CSS.supports("contain-intrinsic-size", "100px") },
+];
+
+function webkitEngineMajor() {
+  for (const p of WEBKIT_PROBES) {
+    try {
+      if (p.test()) return { major: p.major, atCeiling: p.major === WEBKIT_PROBE_CEILING, floor: false };
+    } catch (e) { /* 次のプローブへ */ }
+  }
+  // 全プローブ不成立 = 最古のプローブ世代より前(それ以上細かくは判別しない)
+  const oldest = WEBKIT_PROBES[WEBKIT_PROBES.length - 1].major;
+  return { major: oldest - 1, atCeiling: false, floor: true };
+}
+
+function detectLineEngine(ua) {
+  const m = ua.match(/Chrome\/(\d+)/);
+  if (m) return { kind: "chrome", major: parseInt(m[1]), atCeiling: false, label: "Chrome " + m[1] + " 相当(Android WebView)" };
+  const probe = webkitEngineMajor();
+  const range = probe.atCeiling ? " 以上" : probe.floor ? " 以前" : "";
+  return { kind: "safari", major: probe.major, atCeiling: probe.atCeiling, floor: probe.floor, label: "Safari " + probe.major + range + " 相当(WebKit)" };
+}
+
 async function detectEnvironment() {
   const ua = navigator.userAgent;
   let browser = parseUA(ua);
@@ -179,23 +219,43 @@ async function detectEnvironment() {
     try {
       hints = await navigator.userAgentData.getHighEntropyValues(["fullVersionList", "platformVersion", "model", "architecture", "bitness"]);
       platformVersion = hints.platformVersion || null;
-      const known = { "Microsoft Edge": "edge", "Google Chrome": "chrome", "Opera": "opera" };
-      for (const b of hints.fullVersionList || []) {
-        if (known[b.brand]) {
-          browser = { key: known[b.brand], name: b.brand, version: b.version };
-          break;
+      // アプリ内ブラウザ(WebView)はブランドに"Google Chrome"を含むことがあるため上書きしない
+      if (browser.key !== "line" && browser.key !== "inapp") {
+        const known = { "Microsoft Edge": "edge", "Google Chrome": "chrome", "Opera": "opera" };
+        for (const b of hints.fullVersionList || []) {
+          if (known[b.brand]) {
+            browser = { key: known[b.brand], name: b.brand, version: b.version };
+            break;
+          }
         }
       }
     } catch (e) { /* UA解析の結果をそのまま使う */ }
   }
 
-  // 検証用: ?ver=100 で検出バージョンを上書きして旧バージョン判定を再現できる
+  if (browser.key === "line") browser = Object.assign({}, browser, { engine: detectLineEngine(ua) });
+
+  // 検証用: ?ver=100 で検出バージョンを上書きして旧バージョン判定を再現できる(LINEはエンジン側を上書き)
   const fake = new URLSearchParams(location.search).get("ver");
-  if (fake && browser.version) browser = Object.assign({}, browser, { version: fake });
+  if (fake && browser.engine) {
+    browser = Object.assign({}, browser, { engine: { kind: browser.engine.kind, major: parseInt(fake), atCeiling: false, label: "検証用 " + fake } });
+  } else if (fake && browser.version) {
+    browser = Object.assign({}, browser, { version: fake });
+  }
+
+  // iOS 26以降、WebKitはUA内のOSバージョンを凍結値(18_6等)で報告する。
+  // エンジン世代の方が新しいと分かる場合はそちらを優先して表示する
+  let os = detectOS(ua, platformVersion) + (platformVersion ? "(platformVersion " + platformVersion + ")" : "");
+  const webkitMajor =
+    browser.engine && browser.engine.kind === "safari" ? browser.engine.major :
+    browser.key === "safari" ? parseInt(browser.version) : null;
+  const uaIOS = os.match(/^(iOS|iPadOS) (\d+)/);
+  if (uaIOS && webkitMajor && webkitMajor > parseInt(uaIOS[2])) {
+    os = uaIOS[1] + " " + webkitMajor + " 系(UAのOS表記「" + os + "」は凍結値)";
+  }
 
   return {
     browser,
-    os: detectOS(ua, platformVersion) + (platformVersion ? "(platformVersion " + platformVersion + ")" : ""),
+    os,
     device: deviceInfo(hints),
     screen: screen.width + "×" + screen.height + (devicePixelRatio !== 1 ? "(表示倍率 " + devicePixelRatio + ")" : ""),
     viewport: innerWidth + "×" + innerHeight,
@@ -214,6 +274,37 @@ async function detectEnvironment() {
  * ============================================================ */
 
 function judge(browser, latest) {
+  // LINEアプリ内ブラウザはエンジン(iOS: WebKit / Android: WebView)のメジャーで
+  // 他ブラウザと同じ基準の判定を行う
+  if (browser.key === "line") {
+    const eng = browser.engine;
+    const latestMajor = latest ? parseInt(latest.version) : null;
+    if (eng && eng.major && latestMajor && eng.major >= latestMajor) {
+      return {
+        status: "ok",
+        title: "お使いの環境は対応しています",
+        detail: "LINEアプリ内ブラウザのエンジン(" + eng.label + ")は最新バージョンです。",
+        short: "対応範囲内(LINE内ブラウザ・エンジン最新)",
+      };
+    }
+    if (eng && eng.major && latestMajor && !eng.atCeiling) {
+      const how = eng.kind === "chrome"
+        ? "Google Play で「Android System WebView」をアップデートすると新しくなります。"
+        : "iOS(設定 > 一般 > ソフトウェア・アップデート)を更新すると新しくなります。";
+      return {
+        status: "warn",
+        title: "ブラウザエンジンのアップデートをおすすめします",
+        detail: "LINEアプリ内ブラウザのエンジン(" + eng.label + ")は最新(バージョン " + latestMajor + ")ではありません。そのままでもご利用いただけますが、一部の画面で表示や動作が最新の環境と異なる場合があります。" + how,
+        short: "要アップデート(LINE内ブラウザ・エンジン最新: " + latestMajor + " / 現在: " + eng.major + (eng.floor ? "以前" : "") + ")",
+      };
+    }
+    return {
+      status: "unknown",
+      title: "判定できませんでした",
+      detail: "下記「お使いの環境」の内容をコピーしてお問い合わせに添えてください。",
+      short: eng && eng.atCeiling ? "判定不能(エンジンは " + eng.major + " 以上・このページの検出上限)" : "判定不能(LINE内ブラウザ)",
+    };
+  }
   if (!SUPPORTED.includes(browser.key)) {
     return {
       status: "ng",
@@ -272,7 +363,7 @@ function render(env, latest, verdict) {
 
   const rows = [
     ["判定結果", verdict.short],
-    ["ブラウザ", env.browser.name + (env.browser.version ? " " + env.browser.version : "")],
+    ["ブラウザ", env.browser.name + (env.browser.version ? " " + env.browser.version : "") + (env.browser.engine ? "(エンジン: " + env.browser.engine.label + ")" : "")],
     ["最新バージョン", latestLabel(latest)],
     ["OS", env.os],
     ["デバイス", env.device],
@@ -334,7 +425,9 @@ function setupCopy(getText) {
   let copyText = render(env, null, { status: "unknown", title: "確認しています…", detail: "最新バージョン情報を取得しています。", short: "確認中" });
   setupCopy(() => copyText);
 
-  const latest = await getLatestVersion(env.browser.key);
+  // LINE内ブラウザは中身のエンジン(Safari/Chrome)の最新版と比較する
+  const latestKey = env.browser.engine ? env.browser.engine.kind : env.browser.key;
+  const latest = await getLatestVersion(latestKey);
   copyText = render(env, latest, judge(env.browser, latest));
 
   if (["localhost", "127.0.0.1"].includes(location.hostname)) reportForDev(env, latest);

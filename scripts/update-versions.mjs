@@ -2,7 +2,7 @@
 // 各ブラウザの公式ソースから最新安定版バージョンを取得し versions.json を書き出す。
 // Node 20+ / 依存パッケージなし。GitHub Actions から週次+手動で実行される想定。
 
-import { writeFile } from "node:fs/promises";
+import { writeFile, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -78,6 +78,19 @@ results.forEach((r, i) => {
 if (errors.length) {
   // 1ソースでも落ちたら失敗させる(部分更新で古い値が混ざるのを防ぐ)
   console.error("failed sources:\n" + errors.join("\n"));
+  process.exit(1);
+}
+
+// app.js のWebKit機能プローブ(iOSのLINE内ブラウザ判定に使用)が
+// 最新Safariメジャーに追随しているか検査する。漏れると判定が「不能」に劣化するため失敗させる。
+const appJs = await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "app.js"), "utf8");
+const ceiling = appJs.match(/WEBKIT_PROBE_CEILING = (\d+)/);
+if (ceiling && parseInt(browsers.safari.latest) > parseInt(ceiling[1])) {
+  console.error(
+    `Safari ${browsers.safari.latest} がリリースされています。` +
+    `app.js の WEBKIT_PROBES に Safari ${parseInt(browsers.safari.latest)} で初出荷された機能のプローブを追加し、` +
+    `WEBKIT_PROBE_CEILING を更新してください。`
+  );
   process.exit(1);
 }
 
